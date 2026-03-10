@@ -1,0 +1,419 @@
+---
+title: "基因表达数据提取与相关性分析"
+author: "自动生成"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 参数设置区域
+
+```{r parameters}
+#=================== 用户可调整参数 ===================
+
+# 目标基因列表
+target_genes <- c("SCN1A", "SCN2A", "SCN3A")
+
+# BrainSpan数据路径
+brainspan_dir <- "BrainSpan" #从8pcw到40yrs的脑组织样本
+
+# GTEx原始数据路径 #需要从官网下载最新版本的，包括成年人多组织的样本
+gtex_data_dir <- "D:/组织表达聚类/data/gtex/data_processing/data"
+gtex_gct_file <- file.path(gtex_data_dir, "GTEx_Analysis_2022-06-06_v10_RNASeQCv2.4.2_gene_tpm_non_lcm.gct")
+gtex_sample_file <- file.path(gtex_data_dir, "GTEx_Analysis_v10_Annotations_SampleAttributesDS.txt")
+
+# 输出目录
+output_dir <- "output"
+
+# 字体设置
+font_family <- "Arial"
+font_size_title <- 14
+font_size_axis <- 12
+font_size_text <- 10
+font_size_annotation <- 10
+
+# 图像尺寸设置（单位：英寸）
+fig_width_corrgram <- 8
+fig_height_corrgram <- 8
+fig_width_scatter <- 4
+fig_height_scatter <- 4
+
+# NPG配色方案
+npg_colors <- c(
+  "#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F",
+  "#8491B4", "#91D1C2", "#DC0000", "#7E6148", "#B09C85"
+)
+
+# 相关性图配色
+corr_colors <- c("#3C5488", "#4DBBD5", "white", "#F39B7F", "#E64B35")
+
+# 散点图设置
+point_color <- "#8491B4"
+line_color <- "#E64B35"
+point_size <- 3
+line_size <- 1.5
+
+# 相关性分析方法
+cor_method <- "pearson"
+
+#===================================================
+```
+
+# 环境设置
+
+```{r environment}
+Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = FALSE)
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+required_packages <- c("readxl", "writexl", "ggplot2", "svglite", "data.table")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+# 第一部分：BrainSpan数据提取
+
+```{r extract_brainspan}
+cat("\n============================================================\n")
+cat("BrainSpan 数据提取\n")
+cat("============================================================\n")
+
+columns_meta <- read.csv(file.path(brainspan_dir, "columns_metadata.csv"))
+rows_meta <- read.csv(file.path(brainspan_dir, "rows_metadata.csv"))
+expression_matrix <- read.csv(file.path(brainspan_dir, "expression_matrix.csv"), header = FALSE)
+
+gene_indices <- sapply(target_genes, function(gene) {
+  idx <- which(rows_meta$gene_symbol == gene)
+  if (length(idx) == 0) {
+    warning(paste("基因", gene, "在BrainSpan数据中未找到"))
+    return(NA)
+  }
+  return(idx[1])
+})
+
+brainspan_data <- data.frame(
+  Sample = columns_meta$structure_acronym,
+  Age = columns_meta$age,
+  Donor = columns_meta$donor_name
+)
+
+for (i in seq_along(target_genes)) {
+  if (!is.na(gene_indices[i])) {
+    brainspan_data[[target_genes[i]]] <- as.numeric(expression_matrix[gene_indices[i], -1])
+  }
+}
+
+brainspan_data$Source <- "BrainSpan"
+
+cat(paste("样本数:", nrow(brainspan_data), "\n"))
+```
+
+# 第二部分：GTEx数据提取
+
+```{r extract_gtex}
+cat("\n============================================================\n")
+cat("GTEx 数据提取（从原始数据）\n")
+cat("============================================================\n")
+
+sample_attrs <- read.delim(gtex_sample_file, stringsAsFactors = FALSE)
+brain_samples <- sample_attrs[sample_attrs$SMTS == "Brain", ]
+
+brain_subtissues <- unique(brain_samples$SMTSD)
+cat("\nBrain亚组织列表:\n")
+for (tissue in sort(brain_subtissues)) {
+  n_samples <- sum(brain_samples$SMTSD == tissue)
+  cat(paste("  -", tissue, ":", n_samples, "个样本\n"))
+}
+
+cat("\n读取GTEx表达矩阵...\n")
+all_colnames <- colnames(fread(gtex_gct_file, skip = 2, nrows = 0))
+all_samples <- all_colnames[-c(1,2)]
+
+brain_sample_ids <- brain_samples$SAMPID
+matched_samples <- all_samples[all_samples %in% brain_sample_ids]
+cat(paste("匹配到", length(matched_samples), "个Brain样本\n"))
+
+gene_info <- fread(gtex_gct_file, skip = 2, select = c("Name", "Description"))
+target_gene_rows <- sapply(target_genes, function(gene) {
+  idx <- which(gene_info$Description == gene)
+  if (length(idx) == 0) {
+    warning(paste("基因", gene, "在GTEx数据中未找到"))
+    return(NA)
+  }
+  return(idx[1])
+})
+
+target_expr <- data.frame(Sample = matched_samples, stringsAsFactors = FALSE)
+
+for (i in seq_along(target_genes)) {
+  if (!is.na(target_gene_rows[i])) {
+    cat(paste("  读取", target_genes[i], "...\n"))
+    skip_rows <- 2 + target_gene_rows[i] - 1
+    gene_expr <- fread(gtex_gct_file, skip = skip_rows, nrows = 1, header = FALSE)
+    colnames(gene_expr) <- all_colnames
+    expr_values <- as.numeric(gene_expr[1, matched_samples, with = FALSE])
+    target_expr[[target_genes[i]]] <- expr_values
+  }
+}
+
+target_expr$Tissue <- sapply(target_expr$Sample, function(s) {
+  tissue_info <- brain_samples$SMTSD[brain_samples$SAMPID == s]
+  if (length(tissue_info) > 0) return(tissue_info[1])
+  else return(NA)
+})
+
+target_expr$Source <- "GTEx"
+
+cat(paste("\n总样本数:", nrow(target_expr), "\n"))
+```
+
+# 第三部分：创建GTEx亚组织数据集
+
+```{r create_gtex_datasets}
+gtex_output_dir <- file.path(output_dir, "GTEx")
+if (!dir.exists(gtex_output_dir)) {
+  dir.create(gtex_output_dir, recursive = TRUE)
+}
+
+gtex_datasets <- list()
+gtex_datasets[["Brain_All"]] <- target_expr
+
+for (tissue in brain_subtissues) {
+  tissue_name <- gsub("Brain - ", "", tissue)
+  tissue_name <- gsub(" ", "_", tissue_name)
+  tissue_name <- gsub("\\(", "", tissue_name)
+  tissue_name <- gsub("\\)", "", tissue_name)
+  
+  tissue_data <- target_expr[target_expr$Tissue == tissue, ]
+  if (nrow(tissue_data) > 0) {
+    gtex_datasets[[tissue_name]] <- tissue_data
+    cat(paste("  -", tissue_name, ":", nrow(tissue_data), "个样本\n"))
+  }
+}
+```
+
+# 第四部分：导出Excel数据
+
+```{r export_excel}
+brainspan_export <- brainspan_data[, c("Sample", "Age", "Donor", "Source", target_genes[target_genes %in% colnames(brainspan_data)])]
+output_path <- file.path(output_dir, "BrainSpan_expression_data.xlsx")
+write_xlsx(list(BrainSpan = brainspan_export), path = output_path)
+cat(paste("BrainSpan数据已导出\n"))
+
+gtex_export_list <- list()
+for (name in names(gtex_datasets)) {
+  dataset <- gtex_datasets[[name]]
+  cols_to_export <- c("Sample", "Tissue", "Source", target_genes[target_genes %in% colnames(dataset)])
+  gtex_export_list[[name]] <- dataset[, cols_to_export]
+}
+
+output_path <- file.path(gtex_output_dir, "GTEx_expression_data.xlsx")
+write_xlsx(gtex_export_list, path = output_path)
+cat(paste("GTEx数据已导出（包含", length(gtex_export_list), "个工作表）\n"))
+```
+
+# 第五部分：定义绘图函数
+
+```{r define_plot_functions}
+panel.raters <- function (x, y, corr = NULL, ...) {
+  if (!is.null(corr)) return()
+  plot.xy(xy.coords(x, y), type = "p", pch = 20, cex = .5, col = point_color, ...)
+  abline(lm(y ~ x), lwd = line_size, col = line_color)
+  box(col = "black", lwd = 2)
+}
+
+textPanel <- function (x = 0.5, y = 0.5, txt, cex, font) {
+  text(x, y, txt, cex = cex, font = font)
+  box(col = "black", lwd = 2)
+}
+
+panel.fill.cor <- function (x, y, corr = NULL, ...) {
+  corr <- round(cor(x, y, use = "pairwise", method = cor_method), 2)
+  ncol <- 14
+  col.regions <- colorRampPalette(corr_colors)
+  pal <- col.regions(ncol)
+  col.ind <- as.numeric(cut(corr, breaks = seq(from = -1, to = 1, length.out = ncol + 1), include.lowest = TRUE))
+  par(new=TRUE)
+  plot(0, type='n', xlim=c(-1,1), ylim=c(-1,1), axes=FALSE, asp=1)
+  usr <- par("usr")
+  rect(usr[1], usr[3], usr[2], usr[4], col = pal[col.ind], border = NA)
+  text(0, 0, labels = corr, cex = 2.5, col = ifelse(corr > 0, "black", "white"))
+  box(col = "black")
+}
+```
+
+# 第六部分：BrainSpan相关性分析
+
+```{r brainspan_analysis}
+cat("\n============================================================\n")
+cat("BrainSpan 相关性分析\n")
+cat("============================================================\n")
+
+brainspan_corr <- brainspan_data[, target_genes[target_genes %in% colnames(brainspan_data)]]
+brainspan_corr <- brainspan_corr[complete.cases(brainspan_corr), ]
+
+cat(paste("样本数:", nrow(brainspan_corr), "\n"))
+
+svg_path <- file.path(output_dir, "BrainSpan_corrgram.svg")
+svg(svg_path, width = fig_width_corrgram, height = fig_height_corrgram)
+par(bg = "#fdfdfd")
+pairs(brainspan_corr, gap = 0.5, text.panel = textPanel,
+      lower.panel = panel.raters, upper.panel = panel.fill.cor)
+dev.off()
+
+genes_for_scatter <- target_genes[target_genes %in% colnames(brainspan_corr)]
+num_genes <- length(genes_for_scatter)
+
+brainspan_results <- data.frame()
+for (i in 1:(num_genes - 1)) {
+  for (j in (i + 1):num_genes) {
+    gene1 <- genes_for_scatter[i]
+    gene2 <- genes_for_scatter[j]
+    
+    plot_data <- data.frame(x = brainspan_corr[[gene1]], y = brainspan_corr[[gene2]])
+    colnames(plot_data) <- c(gene1, gene2)
+    
+    cor_result <- cor.test(plot_data[[1]], plot_data[[2]], method = cor_method)
+    
+    scatter_plot <- ggplot(plot_data, aes(x = .data[[gene1]], y = .data[[gene2]])) +
+      geom_point(color = point_color, size = point_size, alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = line_color, linewidth = line_size) +
+      labs(x = gene1, y = gene2, title = "BrainSpan") +
+      annotate("text", x = Inf, y = -Inf,
+               label = paste0("R = ", round(cor_result$estimate, 2), "\nP = ", format.pval(cor_result$p.value, digits = 2)),
+               hjust = 1.1, vjust = -0.5, size = font_size_annotation / 3, color = "black") +
+      theme_bw() +
+      theme(panel.background = element_blank(), panel.grid = element_blank(),
+            axis.line = element_line(color = "black", linewidth = 0.5),
+            axis.text = element_text(color = "black", size = font_size_text),
+            axis.title = element_text(color = "black", size = font_size_axis),
+            panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+            aspect.ratio = 1, plot.title = element_text(hjust = 0.5, size = font_size_title))
+    
+    ggsave(file.path(output_dir, paste0("BrainSpan_scatter_", gene1, "_", gene2, ".svg")),
+           plot = scatter_plot, device = "svg", width = fig_width_scatter, height = fig_height_scatter)
+    
+    brainspan_results <- rbind(brainspan_results, data.frame(
+      Dataset = "BrainSpan", Gene1 = gene1, Gene2 = gene2,
+      Correlation = round(cor_result$estimate, 4),
+      P_value = format.pval(cor_result$p.value, digits = 3),
+      Method = cor_method
+    ))
+  }
+}
+
+cat(paste("生成", nrow(brainspan_results), "个散点图\n"))
+```
+
+# 第七部分：GTEx相关性分析
+
+```{r gtex_analysis}
+cat("\n============================================================\n")
+cat("GTEx 相关性分析\n")
+cat("============================================================\n")
+
+gtex_all_results <- data.frame()
+
+for (dataset_name in names(gtex_datasets)) {
+  cat(paste("\n分析:", dataset_name, "\n"))
+  
+  dataset <- gtex_datasets[[dataset_name]]
+  expr_data <- dataset[, target_genes[target_genes %in% colnames(dataset)]]
+  expr_data <- expr_data[complete.cases(expr_data), ]
+  
+  if (nrow(expr_data) < 3) {
+    cat(paste("  样本数不足，跳过\n"))
+    next
+  }
+  
+  cat(paste("  样本数:", nrow(expr_data), "\n"))
+  
+  tissue_dir <- file.path(gtex_output_dir, dataset_name)
+  if (!dir.exists(tissue_dir)) {
+    dir.create(tissue_dir, recursive = TRUE)
+  }
+  
+  svg_path <- file.path(tissue_dir, paste0(dataset_name, "_corrgram.svg"))
+  svg(svg_path, width = fig_width_corrgram, height = fig_height_corrgram)
+  par(bg = "#fdfdfd")
+  pairs(expr_data, gap = 0.5, text.panel = textPanel,
+        lower.panel = panel.raters, upper.panel = panel.fill.cor)
+  dev.off()
+  
+  genes_for_scatter <- target_genes[target_genes %in% colnames(expr_data)]
+  num_genes <- length(genes_for_scatter)
+  
+  plot_count <- 0
+  for (i in 1:(num_genes - 1)) {
+    for (j in (i + 1):num_genes) {
+      gene1 <- genes_for_scatter[i]
+      gene2 <- genes_for_scatter[j]
+      
+      plot_data <- data.frame(x = expr_data[[gene1]], y = expr_data[[gene2]])
+      colnames(plot_data) <- c(gene1, gene2)
+      
+      cor_result <- cor.test(plot_data[[1]], plot_data[[2]], method = cor_method)
+      
+      scatter_plot <- ggplot(plot_data, aes(x = .data[[gene1]], y = .data[[gene2]])) +
+        geom_point(color = point_color, size = point_size, alpha = 0.6) +
+        geom_smooth(method = "lm", se = FALSE, color = line_color, linewidth = line_size) +
+        labs(x = gene1, y = gene2, title = dataset_name) +
+        annotate("text", x = Inf, y = -Inf,
+                 label = paste0("R = ", round(cor_result$estimate, 2), "\nP = ", format.pval(cor_result$p.value, digits = 2)),
+                 hjust = 1.1, vjust = -0.5, size = font_size_annotation / 3, color = "black") +
+        theme_bw() +
+        theme(panel.background = element_blank(), panel.grid = element_blank(),
+              axis.line = element_line(color = "black", linewidth = 0.5),
+              axis.text = element_text(color = "black", size = font_size_text),
+              axis.title = element_text(color = "black", size = font_size_axis),
+              panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+              aspect.ratio = 1, plot.title = element_text(hjust = 0.5, size = font_size_title))
+      
+      ggsave(file.path(tissue_dir, paste0(dataset_name, "_scatter_", gene1, "_", gene2, ".svg")),
+             plot = scatter_plot, device = "svg", width = fig_width_scatter, height = fig_height_scatter)
+      
+      plot_count <- plot_count + 1
+      
+      gtex_all_results <- rbind(gtex_all_results, data.frame(
+        Dataset = paste0("GTEx_", dataset_name), Gene1 = gene1, Gene2 = gene2,
+        Correlation = round(cor_result$estimate, 4),
+        P_value = format.pval(cor_result$p.value, digits = 3),
+        Method = cor_method
+      ))
+    }
+  }
+  
+  cat(paste("  生成", plot_count, "个散点图\n"))
+}
+```
+
+# 第八部分：保存汇总结果
+
+```{r save_summary}
+all_results <- rbind(brainspan_results, gtex_all_results)
+summary_path <- file.path(output_dir, "correlation_summary.csv")
+write.csv(all_results, summary_path, row.names = FALSE)
+
+cat("\n============================================================\n")
+cat("分析完成！\n")
+cat("============================================================\n")
+cat(paste("总计", nrow(all_results), "个相关性分析结果\n"))
+cat(paste("汇总表已保存到:", summary_path, "\n"))
+```
+
+# 会话信息
+
+```{r session_info}
+sessionInfo()
+```
